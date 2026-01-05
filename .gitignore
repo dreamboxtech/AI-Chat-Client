@@ -1,0 +1,10 @@
+# Ignore files in these directories
+models/**
+other_files/**
+
+# Keep the models folder itself
+!models/
+!models/.gitkeep
+
+# Skip these specific files
+* llama_cpp_python-0.3.16+cuda12.1.sm89.ada-cp312-cp312-win_amd64.whl
