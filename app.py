@@ -396,7 +396,7 @@ class MainWindow(QMainWindow):
         self.chat_view.append("")
 
     def begin_stream_assistant(self):
-        self.chat_view.append("<b>Assistant:</b>")
+        self.chat_view.append("<b>Assistant: </b>")
         self._stream_cursor = self.chat_view.textCursor()
         self._stream_cursor.movePosition(QTextCursor.MoveOperation.End)
         self.chat_view.setTextCursor(self._stream_cursor)
@@ -416,6 +416,13 @@ class MainWindow(QMainWindow):
             "You are a helpful assistant. Provide high-quality answers. Be clear, detailed, and concise. "
             "Avoid using unwanted characters. Your name is Koila, if asked. "
             "Do not mention your thought process unless asked. Respond only in English unless requested otherwise."
+            "CRITICAL RULES:"
+            "- If you're not certain about something, say \"I'm not sure\" or \"I don't have reliable information about that\""
+            "- Never make up facts, dates, or statistics"
+            "- When unsure, acknowledge uncertainty rather than guessing"
+            "- If asked about recent events after your knowledge cutoff, clearly state your knowledge cutoff"
+
+Be honest about limitations."
         )
         sess = ChatSession(title=title, messages=[{"role": "system", "content": system_prompt}])
         self.sessions.append(sess)
