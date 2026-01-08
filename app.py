@@ -1,8 +1,13 @@
 import os
 import sys
 import time
+import json
+import re
+import sqlite3
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Iterable
+from typing import List, Dict, Optional, Iterable, Tuple
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QTextCursor
@@ -32,22 +37,168 @@ class AppSettings:
     stream: bool = True
 
     # Runtime speed knobs (model-agnostic)
-    n_ctx: int = 2048                 # smaller = faster + less RAM
+    n_ctx: int = 2048
     n_threads: int = max(1, (os.cpu_count() or 8) - 1)
-    n_batch: int = 256                # 128/256/512; higher can help throughput
-    n_gpu_layers: int = 0             # optional acceleration if supported
-    use_mmap: bool = True             # mmap model file (often faster startup / lower RAM pressure)
-    use_mlock: bool = False           # lock pages in RAM (can help stability/perf if enough RAM)
-    flash_attn: bool = False          # keep off by default; enable only if stable on your build
+    n_batch: int = 256
+    n_gpu_layers: int = 0
+    use_mmap: bool = True
+    use_mlock: bool = False
+    flash_attn: bool = False
 
-    # Keep UI fast over time: cap history
-    keep_last_messages: int = 16      # last N messages (user+assistant), system always kept
+    # Keep UI fast over time
+    keep_last_messages: int = 16
+
+    # Browsing (model-agnostic hallucination reducer)
+    browse_enabled_default: bool = False
+    browse_num_sources: int = 3
+    browse_timeout_sec: int = 12
+    browse_max_chars_per_source: int = 1600  # keep evidence small for speed
+    browse_cache_enabled: bool = True
 
 
 @dataclass
 class ChatSession:
     title: str
     messages: List[Message]
+
+
+# -----------------------------
+# Simple web search + fetch (DuckDuckGo Lite/HTML)
+# -----------------------------
+
+class WebCache:
+    """Tiny SQLite cache for fetched pages."""
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init()
+
+    def _init(self):
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        with sqlite3.connect(self.db_path) as con:
+            con.execute(
+                "CREATE TABLE IF NOT EXISTS cache (url TEXT PRIMARY KEY, ts INTEGER, content TEXT)"
+            )
+
+    def get(self, url: str) -> Optional[str]:
+        with sqlite3.connect(self.db_path) as con:
+            row = con.execute("SELECT content FROM cache WHERE url=?", (url,)).fetchone()
+            return row[0] if row else None
+
+    def put(self, url: str, content: str):
+        with sqlite3.connect(self.db_path) as con:
+            con.execute(
+                "INSERT OR REPLACE INTO cache(url, ts, content) VALUES(?, strftime('%s','now'), ?)",
+                (url, content),
+            )
+
+
+class Browser:
+    """
+    Best-effort, no-API-key browsing:
+    - search with DuckDuckGo Lite (fast HTML)
+    - fallback to DDG HTML
+    - fetch pages and extract rough text
+    """
+    def __init__(self, timeout_sec: int = 12, cache: Optional[WebCache] = None):
+        self.timeout_sec = timeout_sec
+        self.cache = cache
+        self.ua = "Mozilla/5.0 (KoilaLocalChat/1.0; +https://example.local)"
+
+    def _http_get(self, url: str) -> str:
+        req = urllib.request.Request(url, headers={"User-Agent": self.ua})
+        with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
+            data = resp.read()
+        # best-effort decode
+        return data.decode("utf-8", errors="ignore")
+
+    def search(self, query: str, k: int) -> List[str]:
+        q = urllib.parse.quote_plus(query)
+
+        # Try Lite first (simpler/faster)
+        lite_url = f"https://lite.duckduckgo.com/lite/?q={q}"
+        try:
+            html = self._http_get(lite_url)
+            urls = self._parse_ddg_lite_results(html, k)
+            if urls:
+                return urls
+        except Exception:
+            pass
+
+        # Fallback to HTML endpoint
+        html_url = f"https://html.duckduckgo.com/html/?q={q}"
+        html = self._http_get(html_url)
+        urls = self._parse_ddg_html_results(html, k)
+        return urls
+
+    def _parse_ddg_lite_results(self, html: str, k: int) -> List[str]:
+        # Lite uses simple <a rel="nofollow" class="result-link" href="...">
+        urls: List[str] = []
+        for m in re.finditer(r'href="(https?://[^"]+)"', html):
+            u = m.group(1)
+            # skip ddg internal/nav
+            if "duckduckgo.com" in urllib.parse.urlparse(u).netloc:
+                continue
+            urls.append(u)
+            if len(urls) >= k:
+                break
+        return self._dedupe(urls)
+
+    def _parse_ddg_html_results(self, html: str, k: int) -> List[str]:
+        # HTML endpoint often uses redirect links with "uddg=" param
+        urls: List[str] = []
+        for m in re.finditer(r'href="([^"]+)"', html):
+            href = m.group(1)
+            if "uddg=" in href:
+                try:
+                    parsed = urllib.parse.urlparse(href)
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    if "uddg" in qs:
+                        u = urllib.parse.unquote(qs["uddg"][0])
+                        if u.startswith("http"):
+                            urls.append(u)
+                except Exception:
+                    continue
+            elif href.startswith("http"):
+                if "duckduckgo.com" in urllib.parse.urlparse(href).netloc:
+                    continue
+                urls.append(href)
+
+            if len(urls) >= k:
+                break
+        return self._dedupe(urls)
+
+    def _dedupe(self, urls: List[str]) -> List[str]:
+        out, seen = [], set()
+        for u in urls:
+            if u in seen:
+                continue
+            seen.add(u)
+            out.append(u)
+        return out
+
+    def fetch_text(self, url: str, max_chars: int) -> str:
+        if self.cache:
+            cached = self.cache.get(url)
+            if cached is not None:
+                return cached[:max_chars]
+
+        html = self._http_get(url)
+        text = self._html_to_text(html)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        if self.cache:
+            self.cache.put(url, text)
+        return text[:max_chars]
+
+    def _html_to_text(self, html: str) -> str:
+        # remove scripts/styles
+        html = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
+        html = re.sub(r"(?is)<style.*?>.*?</style>", " ", html)
+        # remove tags
+        html = re.sub(r"(?s)<.*?>", " ", html)
+        # decode some entities
+        html = html.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        return html
 
 
 # -----------------------------
@@ -63,9 +214,6 @@ class LlamaCppEngine:
         self._llm = None
         self._signature = None
 
-    def is_loaded(self) -> bool:
-        return self._llm is not None
-
     def load_if_needed(self, s: AppSettings):
         if not s.model_path or not os.path.exists(s.model_path):
             raise FileNotFoundError("GGUF model path is missing or invalid.")
@@ -77,10 +225,7 @@ class LlamaCppEngine:
         if self._llm is not None and self._signature == sig:
             return
 
-        # Always clean state before reload
         self.unload()
-
-        # Build model instance
         self._llm = Llama(
             model_path=s.model_path,
             n_ctx=s.n_ctx,
@@ -95,26 +240,13 @@ class LlamaCppEngine:
         self._signature = sig
 
     def _trim_history(self, messages: List[Message], keep_last: int) -> List[Message]:
-        """Keep system + last N non-system messages to avoid slowdown over time."""
         if keep_last <= 0:
             return messages
-
         system = [m for m in messages if m["role"] == "system"]
         rest = [m for m in messages if m["role"] != "system"]
         return system + rest[-keep_last:]
 
-    def chat_blocking(self, messages: List[Message], s: AppSettings) -> str:
-        self.load_if_needed(s)
-        msgs = self._trim_history(messages, s.keep_last_messages)
-        out = self._llm.create_chat_completion(
-            messages=msgs,
-            temperature=s.temperature,
-            max_tokens=s.max_tokens,
-        )
-        return out["choices"][0]["message"]["content"]
-
     def chat_stream(self, messages: List[Message], s: AppSettings) -> Iterable[str]:
-        """Yields text chunks."""
         self.load_if_needed(s)
         msgs = self._trim_history(messages, s.keep_last_messages)
 
@@ -124,41 +256,19 @@ class LlamaCppEngine:
             max_tokens=s.max_tokens,
             stream=True,
         )
-
-        # Stream returns incremental deltas
         for chunk in stream:
-            # Safe extraction across llama-cpp-python variants
             try:
                 delta = chunk["choices"][0].get("delta", {})
                 text = delta.get("content", "")
                 if text:
                     yield text
             except Exception:
-                # If structure differs, ignore that chunk
                 continue
 
 
 # -----------------------------
 # Workers
 # -----------------------------
-
-class GenerateWorker(QThread):
-    finished_text = pyqtSignal(str)
-    failed = pyqtSignal(str)
-
-    def __init__(self, engine: LlamaCppEngine, messages: List[Message], settings: AppSettings):
-        super().__init__()
-        self.engine = engine
-        self.messages = messages
-        self.settings = settings
-
-    def run(self):
-        try:
-            text = self.engine.chat_blocking(self.messages, self.settings)
-            self.finished_text.emit(text)
-        except Exception as e:
-            self.failed.emit(str(e))
-
 
 class StreamWorker(QThread):
     chunk = pyqtSignal(str)
@@ -178,6 +288,71 @@ class StreamWorker(QThread):
                 self._accum.append(t)
                 self.chunk.emit(t)
             self.finished_full.emit("".join(self._accum))
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class BrowseAndStreamWorker(QThread):
+    status = pyqtSignal(str)
+    chunk = pyqtSignal(str)
+    finished_full = pyqtSignal(str, str)  # (assistant_text, sources_text)
+    failed = pyqtSignal(str)
+
+    def __init__(self, engine: LlamaCppEngine, base_messages: List[Message], user_query: str, settings: AppSettings, browser: Browser):
+        super().__init__()
+        self.engine = engine
+        self.base_messages = base_messages
+        self.user_query = user_query
+        self.settings = settings
+        self.browser = browser
+        self._accum: List[str] = []
+
+    def run(self):
+        try:
+            self.status.emit("Browsing…")
+            urls = self.browser.search(self.user_query, self.settings.browse_num_sources)
+
+            snippets: List[Tuple[str, str]] = []
+            for i, url in enumerate(urls, start=1):
+                try:
+                    txt = self.browser.fetch_text(url, self.settings.browse_max_chars_per_source)
+                    if txt:
+                        snippets.append((url, txt))
+                except Exception:
+                    continue
+
+            if not snippets:
+                # fallback: still answer, but tell model no sources found
+                evidence = "No web sources could be fetched."
+                sources_text = ""
+            else:
+                evidence_lines = ["Web evidence (use for answering; cite as [1], [2], ...):"]
+                sources_lines = []
+                for idx, (url, txt) in enumerate(snippets, start=1):
+                    evidence_lines.append(f"[{idx}] {url}\n{txt}\n")
+                    sources_lines.append(f"[{idx}] {url}")
+                evidence = "\n".join(evidence_lines).strip()
+                sources_text = "\n".join(sources_lines).strip()
+
+            browse_rules = (
+                "BROWSING RULES:\n"
+                "- Use the provided web evidence when answering.\n"
+                "- If the evidence does not contain the answer, say you couldn't confirm from sources.\n"
+                "- Do not invent facts.\n"
+                "- Add citations like [1] [2] next to the relevant sentences.\n"
+            )
+
+            augmented = list(self.base_messages)
+            augmented.append({"role": "system", "content": browse_rules})
+            augmented.append({"role": "system", "content": evidence})
+            augmented.append({"role": "user", "content": self.user_query})
+
+            self.status.emit("Answering…")
+            for t in self.engine.chat_stream(augmented, self.settings):
+                self._accum.append(t)
+                self.chunk.emit(t)
+
+            self.finished_full.emit("".join(self._accum), sources_text)
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -247,6 +422,25 @@ class SettingsDialog(QDialog):
         self.keep_last.setRange(4, 200)
         self.keep_last.setValue(self.settings.keep_last_messages)
 
+        # Browsing
+        self.browse_default = QCheckBox("Enable browsing by default")
+        self.browse_default.setChecked(self.settings.browse_enabled_default)
+
+        self.browse_sources = QSpinBox()
+        self.browse_sources.setRange(1, 8)
+        self.browse_sources.setValue(self.settings.browse_num_sources)
+
+        self.browse_timeout = QSpinBox()
+        self.browse_timeout.setRange(3, 60)
+        self.browse_timeout.setValue(self.settings.browse_timeout_sec)
+
+        self.browse_max_chars = QSpinBox()
+        self.browse_max_chars.setRange(200, 6000)
+        self.browse_max_chars.setValue(self.settings.browse_max_chars_per_source)
+
+        self.browse_cache = QCheckBox("Cache fetched pages (recommended)")
+        self.browse_cache.setChecked(self.settings.browse_cache_enabled)
+
         form.addRow("Model (GGUF):", row_wrap)
         form.addRow("Temperature:", self.temperature)
         form.addRow("Max tokens:", self.max_tokens)
@@ -259,6 +453,13 @@ class SettingsDialog(QDialog):
         form.addRow("", self.use_mlock)
         form.addRow("", self.flash_attn)
         form.addRow("Keep last messages:", self.keep_last)
+
+        form.addRow("Browsing:", QLabel("<b>Web browsing</b>"))
+        form.addRow("", self.browse_default)
+        form.addRow("Sources:", self.browse_sources)
+        form.addRow("Timeout (sec):", self.browse_timeout)
+        form.addRow("Max chars/source:", self.browse_max_chars)
+        form.addRow("", self.browse_cache)
 
         layout.addLayout(form)
 
@@ -295,6 +496,12 @@ class SettingsDialog(QDialog):
         self.settings.flash_attn = bool(self.flash_attn.isChecked())
 
         self.settings.keep_last_messages = int(self.keep_last.value())
+
+        self.settings.browse_enabled_default = bool(self.browse_default.isChecked())
+        self.settings.browse_num_sources = int(self.browse_sources.value())
+        self.settings.browse_timeout_sec = int(self.browse_timeout.value())
+        self.settings.browse_max_chars_per_source = int(self.browse_max_chars.value())
+        self.settings.browse_cache_enabled = bool(self.browse_cache.isChecked())
         return True
 
 
@@ -310,12 +517,14 @@ class MainWindow(QMainWindow):
         self.settings = AppSettings()
         self.engine = LlamaCppEngine()
 
+        cache = WebCache(db_path=os.path.join(os.path.expanduser("~"), ".koila", "webcache.sqlite"))
+        self.browser = Browser(timeout_sec=self.settings.browse_timeout_sec, cache=cache)
+
         self.sessions: List[ChatSession] = []
         self.current_index: int = -1
 
-        # workers
-        self.worker_block: Optional[GenerateWorker] = None
         self.worker_stream: Optional[StreamWorker] = None
+        self.worker_browse: Optional[BrowseAndStreamWorker] = None
 
         self._build_ui()
         self._build_menu()
@@ -360,8 +569,14 @@ class MainWindow(QMainWindow):
         input_row = QHBoxLayout()
         self.input = QLineEdit()
         self.input.setPlaceholderText("Type a message…")
+
+        self.chk_browse = QCheckBox("Browse")
+        self.chk_browse.setChecked(self.settings.browse_enabled_default)
+
         self.btn_send = QPushButton("Send")
+
         input_row.addWidget(self.input)
+        input_row.addWidget(self.chk_browse)
         input_row.addWidget(self.btn_send)
 
         self.status = QLabel("Ready. (Set model in App → Settings)")
@@ -388,7 +603,9 @@ class MainWindow(QMainWindow):
         self.input.setEnabled(not busy)
         self.btn_new_chat.setEnabled(not busy)
         self.session_list.setEnabled(not busy)
-        self.status.setText("Generating…" if busy else "Ready.")
+        self.chk_browse.setEnabled(not busy)
+        if not busy:
+            self.status.setText("Ready.")
 
     def append_block(self, who: str, text: str):
         self.chat_view.append(f"<b>{who}:</b>")
@@ -415,14 +632,8 @@ class MainWindow(QMainWindow):
         system_prompt = (
             "You are a helpful assistant. Provide high-quality answers. Be clear, detailed, and concise. "
             "Avoid using unwanted characters. Your name is Koila, if asked. "
-            "Do not mention your thought process unless asked. Respond only in English unless requested otherwise."
-            "CRITICAL RULES:"
-            "- If you're not certain about something, say \"I'm not sure\" or \"I don't have reliable information about that\""
-            "- Never make up facts, dates, or statistics"
-            "- When unsure, acknowledge uncertainty rather than guessing"
-            "- If asked about recent events after your knowledge cutoff, clearly state your knowledge cutoff"
-
-Be honest about limitations."
+            "Do not mention your thought process unless asked. Respond only in English unless requested otherwise. "
+            "CRITICAL RULES: If you're not certain, say you are not sure. Never make up facts."
         )
         sess = ChatSession(title=title, messages=[{"role": "system", "content": system_prompt}])
         self.sessions.append(sess)
@@ -449,7 +660,11 @@ Be honest about limitations."
         if dlg.exec() == QDialog.DialogCode.Accepted:
             if dlg.apply():
                 self.engine.unload()
-                self.status.setText("Settings saved. (Use Warm-load for first-run speed)")
+                # update browser timeout/cache preference
+                cache = WebCache(db_path=os.path.join(os.path.expanduser("~"), ".koila", "webcache.sqlite")) if self.settings.browse_cache_enabled else None
+                self.browser = Browser(timeout_sec=self.settings.browse_timeout_sec, cache=cache)
+                self.chk_browse.setChecked(self.settings.browse_enabled_default)
+                self.status.setText("Settings saved.")
             else:
                 self.status.setText("Settings not applied.")
 
@@ -480,59 +695,65 @@ Be honest about limitations."
         if self.current_index < 0:
             return
 
-        text = self.input.text().strip()
-        if not text:
+        user_text = self.input.text().strip()
+        if not user_text:
             return
 
         if not self.settings.model_path:
             QMessageBox.information(self, "Model required", "Set a GGUF model in App → Settings first.")
             return
 
-        self.input.clear()
         sess = self.sessions[self.current_index]
-        sess.messages.append({"role": "user", "content": text})
-        self.append_block("You", text)
+        sess.messages.append({"role": "user", "content": user_text})
+        self.input.clear()
+        self.append_block("You", user_text)
 
         self.set_busy(True)
+        self.begin_stream_assistant()
 
-        if self.settings.stream:
-            self.begin_stream_assistant()
+        browse_this = self.chk_browse.isChecked()
+        if browse_this:
+            self.status.setText("Browsing…")
+            # base messages exclude the just-added user turn (we add it after evidence)
+            base = [m for m in sess.messages if not (m["role"] == "user" and m["content"] == user_text)]
+            self.worker_browse = BrowseAndStreamWorker(self.engine, base, user_text, self.settings, self.browser)
+            self.worker_browse.status.connect(self.status.setText)
+            self.worker_browse.chunk.connect(self.append_stream_chunk)
+            self.worker_browse.finished_full.connect(self.on_browse_done)
+            self.worker_browse.failed.connect(self.on_failed)
+            self.worker_browse.start()
+        else:
+            self.status.setText("Answering…")
             self.worker_stream = StreamWorker(self.engine, list(sess.messages), self.settings)
             self.worker_stream.chunk.connect(self.append_stream_chunk)
             self.worker_stream.finished_full.connect(self.on_stream_done)
             self.worker_stream.failed.connect(self.on_failed)
             self.worker_stream.start()
-        else:
-            self.worker_block = GenerateWorker(self.engine, list(sess.messages), self.settings)
-            self.worker_block.finished_text.connect(self.on_done)
-            self.worker_block.failed.connect(self.on_failed)
-            self.worker_block.start()
+
+    def on_browse_done(self, full_text: str, sources_text: str):
+        self.end_stream_assistant()
+        sess = self.sessions[self.current_index]
+        sess.messages.append({"role": "assistant", "content": full_text})
+        if sources_text:
+            self.append_block("Sources", sources_text)
+        self._autotitle_if_first_user(sess)
+        self.set_busy(False)
+        self.worker_browse = None
 
     def on_stream_done(self, full_text: str):
         self.end_stream_assistant()
-
         sess = self.sessions[self.current_index]
         sess.messages.append({"role": "assistant", "content": full_text})
         self._autotitle_if_first_user(sess)
-
         self.set_busy(False)
         self.worker_stream = None
-
-    def on_done(self, assistant_text: str):
-        sess = self.sessions[self.current_index]
-        sess.messages.append({"role": "assistant", "content": assistant_text})
-        self.append_block("Assistant", assistant_text)
-        self._autotitle_if_first_user(sess)
-
-        self.set_busy(False)
-        self.worker_block = None
 
     def on_failed(self, err: str):
         self.engine.unload()
         QMessageBox.critical(self, "Generation failed", err)
         self.set_busy(False)
-        self.worker_block = None
         self.worker_stream = None
+        self.worker_browse = None
 
 
 def main():
