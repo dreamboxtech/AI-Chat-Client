@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QListWidget, QMessageBox, QFileDialog,
     QDialog, QFormLayout, QSpinBox, QDoubleSpinBox, QDialogButtonBox,
-    QCheckBox, QPlainTextEdit, QLineEdit, QTextBrowser
+    QCheckBox, QPlainTextEdit, QLineEdit, QTextBrowser, QComboBox
 )
 
 from llama_cpp import Llama
@@ -24,11 +24,16 @@ Message = Dict[str, str]  # {"role": "system"|"user"|"assistant", "content": "..
 
 @dataclass
 class AppSettings:
+    # Model selection
     model_path: str = ""
+    models_dir: str = ""  # folder containing .gguf files (optional)
+
+    # Generation
     temperature: float = 0.7
     max_tokens: int = 256
     stream: bool = True
 
+    # Runtime knobs (speed)
     n_ctx: int = 2048
     n_threads: int = max(1, (os.cpu_count() or 8) - 1)
     n_batch: int = 256
@@ -37,8 +42,10 @@ class AppSettings:
     use_mlock: bool = False
     flash_attn: bool = False
 
+    # Prevent "slower over time"
     keep_last_messages: int = 16
 
+    # Browsing
     browse_enabled_default: bool = False
     browse_num_sources: int = 3
     browse_timeout_sec: int = 12
@@ -343,6 +350,7 @@ class BrowseAndStreamWorker(QThread):
 
             browse_rules = (
                 "BROWSING RULES:\n"
+                "- You DO have web evidence below. Do NOT say you can't browse or lack real-time access.\n"
                 "- Use the provided web evidence when answering.\n"
                 "- If the evidence does not contain the answer, say you couldn't confirm from sources.\n"
                 "- Do not invent facts.\n"
@@ -364,22 +372,22 @@ class BrowseAndStreamWorker(QThread):
             self.failed.emit(str(e))
 
 
-class SettingsDialog(QDialog):
+class AppSettingsDialog(QDialog):
     def __init__(self, parent, settings: AppSettings):
         super().__init__(parent)
-        self.setWindowTitle("Settings")
+        self.setWindowTitle("Settings — App & Model")
         self.settings = settings
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
 
-        self.model_path = QLineEdit(self.settings.model_path)
-        self.btn_browse = QPushButton("Browse…")
-        row = QHBoxLayout()
-        row.addWidget(self.model_path)
-        row.addWidget(self.btn_browse)
-        row_wrap = QWidget()
-        row_wrap.setLayout(row)
+        self.models_dir = QLineEdit(self.settings.models_dir)
+        self.btn_models_dir = QPushButton("Browse…")
+        row_dir = QHBoxLayout()
+        row_dir.addWidget(self.models_dir)
+        row_dir.addWidget(self.btn_models_dir)
+        row_dir_wrap = QWidget()
+        row_dir_wrap.setLayout(row_dir)
 
         self.temperature = QDoubleSpinBox()
         self.temperature.setRange(0.0, 2.0)
@@ -422,6 +430,66 @@ class SettingsDialog(QDialog):
         self.keep_last.setRange(4, 200)
         self.keep_last.setValue(self.settings.keep_last_messages)
 
+        form.addRow("Models folder:", row_dir_wrap)
+        form.addRow("Temperature:", self.temperature)
+        form.addRow("Max tokens:", self.max_tokens)
+        form.addRow("", self.stream)
+        form.addRow("Context (n_ctx):", self.n_ctx)
+        form.addRow("Threads:", self.n_threads)
+        form.addRow("Batch (n_batch):", self.n_batch)
+        form.addRow("GPU layers:", self.n_gpu_layers)
+        form.addRow("", self.use_mmap)
+        form.addRow("", self.use_mlock)
+        form.addRow("", self.flash_attn)
+        form.addRow("Keep last messages:", self.keep_last)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        layout.addWidget(buttons)
+
+        self.btn_models_dir.clicked.connect(self.on_pick_models_dir)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+    def on_pick_models_dir(self):
+        path = QFileDialog.getExistingDirectory(self, "Select models folder", self.models_dir.text().strip() or "")
+        if path:
+            self.models_dir.setText(path)
+
+    def apply(self) -> bool:
+        md = self.models_dir.text().strip()
+        if md and not os.path.isdir(md):
+            QMessageBox.warning(self, "Invalid folder", "Models folder does not exist.")
+            return False
+
+        self.settings.models_dir = md
+        self.settings.temperature = float(self.temperature.value())
+        self.settings.max_tokens = int(self.max_tokens.value())
+        self.settings.stream = bool(self.stream.isChecked())
+
+        self.settings.n_ctx = int(self.n_ctx.value())
+        self.settings.n_threads = int(self.n_threads.value())
+        self.settings.n_batch = int(self.n_batch.value())
+        self.settings.n_gpu_layers = int(self.n_gpu_layers.value())
+
+        self.settings.use_mmap = bool(self.use_mmap.isChecked())
+        self.settings.use_mlock = bool(self.use_mlock.isChecked())
+        self.settings.flash_attn = bool(self.flash_attn.isChecked())
+
+        self.settings.keep_last_messages = int(self.keep_last.value())
+        return True
+
+
+class BrowsingSettingsDialog(QDialog):
+    def __init__(self, parent, settings: AppSettings):
+        super().__init__(parent)
+        self.setWindowTitle("Settings — Browsing")
+        self.settings = settings
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
         self.browse_default = QCheckBox("Enable browsing by default")
         self.browse_default.setChecked(self.settings.browse_enabled_default)
 
@@ -444,20 +512,6 @@ class SettingsDialog(QDialog):
         self.browse_cache = QCheckBox("Cache fetched pages (recommended)")
         self.browse_cache.setChecked(self.settings.browse_cache_enabled)
 
-        form.addRow("Model (GGUF):", row_wrap)
-        form.addRow("Temperature:", self.temperature)
-        form.addRow("Max tokens:", self.max_tokens)
-        form.addRow("", self.stream)
-        form.addRow("Context (n_ctx):", self.n_ctx)
-        form.addRow("Threads:", self.n_threads)
-        form.addRow("Batch (n_batch):", self.n_batch)
-        form.addRow("GPU layers:", self.n_gpu_layers)
-        form.addRow("", self.use_mmap)
-        form.addRow("", self.use_mlock)
-        form.addRow("", self.flash_attn)
-        form.addRow("Keep last messages:", self.keep_last)
-
-        form.addRow("Browsing:", QLabel("<b>Web browsing</b>"))
         form.addRow("", self.browse_default)
         form.addRow("Sources:", self.browse_sources)
         form.addRow("Timeout (sec):", self.browse_timeout)
@@ -470,37 +524,10 @@ class SettingsDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         layout.addWidget(buttons)
 
-        self.btn_browse.clicked.connect(self.on_browse)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
-    def on_browse(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select GGUF model", "", "GGUF (*.gguf);;All files (*.*)")
-        if path:
-            self.model_path.setText(path)
-
     def apply(self) -> bool:
-        mp = self.model_path.text().strip()
-        if mp and not os.path.exists(mp):
-            QMessageBox.warning(self, "Invalid model path", "Selected model file does not exist.")
-            return False
-
-        self.settings.model_path = mp
-        self.settings.temperature = float(self.temperature.value())
-        self.settings.max_tokens = int(self.max_tokens.value())
-        self.settings.stream = bool(self.stream.isChecked())
-
-        self.settings.n_ctx = int(self.n_ctx.value())
-        self.settings.n_threads = int(self.n_threads.value())
-        self.settings.n_batch = int(self.n_batch.value())
-        self.settings.n_gpu_layers = int(self.n_gpu_layers.value())
-
-        self.settings.use_mmap = bool(self.use_mmap.isChecked())
-        self.settings.use_mlock = bool(self.use_mlock.isChecked())
-        self.settings.flash_attn = bool(self.flash_attn.isChecked())
-
-        self.settings.keep_last_messages = int(self.keep_last.value())
-
         self.settings.browse_enabled_default = bool(self.browse_default.isChecked())
         self.settings.browse_num_sources = int(self.browse_sources.value())
         self.settings.browse_timeout_sec = int(self.browse_timeout.value())
@@ -531,13 +558,7 @@ class MainWindow(QMainWindow):
         self.settings = AppSettings()
         self.engine = LlamaCppEngine()
 
-        cache = WebCache(db_path=os.path.join(os.path.expanduser("~"), ".koila", "webcache.sqlite"))
-        self.browser = Browser(
-            timeout_sec=self.settings.browse_timeout_sec,
-            max_chars_per_source=self.settings.browse_max_chars_per_source,
-            min_text_len=self.settings.browse_min_text_len,
-            cache=cache if self.settings.browse_cache_enabled else None
-        )
+        self._rebuild_browser()
 
         self.sessions: List[ChatSession] = []
         self.current_index: int = -1
@@ -551,16 +572,29 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self.new_chat()
 
+    def _rebuild_browser(self):
+        cache = WebCache(db_path=os.path.join(os.path.expanduser("~"), ".koila", "webcache.sqlite")) if self.settings.browse_cache_enabled else None
+        self.browser = Browser(
+            timeout_sec=self.settings.browse_timeout_sec,
+            max_chars_per_source=self.settings.browse_max_chars_per_source,
+            min_text_len=self.settings.browse_min_text_len,
+            cache=cache
+        )
+
     def _build_menu(self):
         menubar = self.menuBar()
         app_menu = menubar.addMenu("App")
-        act_settings = app_menu.addAction("Settings…")
+
+        act_settings_app = app_menu.addAction("Settings — App & Model…")
+        act_settings_browse = app_menu.addAction("Settings — Browsing…")
+        app_menu.addSeparator()
         act_warm = app_menu.addAction("Warm-load model")
         act_unload = app_menu.addAction("Unload model")
         app_menu.addSeparator()
         act_quit = app_menu.addAction("Quit")
 
-        act_settings.triggered.connect(self.open_settings)
+        act_settings_app.triggered.connect(self.open_app_settings)
+        act_settings_browse.triggered.connect(self.open_browsing_settings)
         act_warm.triggered.connect(self.warm_load_model)
         act_unload.triggered.connect(self.unload_model)
         act_quit.triggered.connect(self.close)
@@ -590,20 +624,26 @@ class MainWindow(QMainWindow):
         )
 
         input_row = QHBoxLayout()
+
         self.input = ChatInput()
         self.input.setPlaceholderText("Type a message… (Enter to send, Shift+Enter for new line)")
         self.input.setFixedHeight(90)
+
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(260)
+        self.model_combo.currentIndexChanged.connect(self.on_model_selected)
 
         self.chk_browse = QCheckBox("Browse")
         self.chk_browse.setChecked(self.settings.browse_enabled_default)
 
         self.btn_send = QPushButton("Send")
 
-        input_row.addWidget(self.input)
+        input_row.addWidget(self.input, 1)
+        input_row.addWidget(self.model_combo)
         input_row.addWidget(self.chk_browse)
         input_row.addWidget(self.btn_send)
 
-        self.status = QLabel("Ready. (Set model in App → Settings)")
+        self.status = QLabel("Ready. (Select a model from dropdown, or set Models folder in settings)")
         self.status.setStyleSheet("color: gray;")
 
         right.addWidget(self.chat_view)
@@ -621,12 +661,50 @@ class MainWindow(QMainWindow):
         self.btn_send.clicked.connect(self.on_send)
         self.input.sendRequested.connect(self.on_send)
 
+        self.refresh_model_list()
+
+    def refresh_model_list(self):
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        self.model_combo.addItem("Select model…", "")
+
+        md = self.settings.models_dir.strip()
+        if md and os.path.isdir(md):
+            for fn in sorted(os.listdir(md)):
+                if fn.lower().endswith(".gguf"):
+                    full = os.path.join(md, fn)
+                    self.model_combo.addItem(fn, full)
+
+        if self.settings.model_path and os.path.isfile(self.settings.model_path):
+            existing = [self.model_combo.itemData(i) for i in range(self.model_combo.count())]
+            if self.settings.model_path not in existing:
+                self.model_combo.addItem(os.path.basename(self.settings.model_path), self.settings.model_path)
+
+        if self.settings.model_path:
+            for i in range(self.model_combo.count()):
+                if self.model_combo.itemData(i) == self.settings.model_path:
+                    self.model_combo.setCurrentIndex(i)
+                    break
+
+        self.model_combo.blockSignals(False)
+
+    def on_model_selected(self, idx: int):
+        path = self.model_combo.itemData(idx)
+        if not path:
+            return
+        if path != self.settings.model_path:
+            self.settings.model_path = path
+            self.engine.unload()
+            self.status.setText(f"Selected model: {os.path.basename(path)}")
+
     def set_busy(self, busy: bool, status: str = ""):
         self.btn_send.setEnabled(not busy)
-        self.input.setEnabled(not busy)
         self.btn_new_chat.setEnabled(not busy)
         self.session_list.setEnabled(not busy)
+        self.model_combo.setEnabled(not busy)
         self.chk_browse.setEnabled(not busy)
+        self.input.setEnabled(True)  # allow typing while busy
+
         if status:
             self.status.setText(status)
         elif not busy:
@@ -674,7 +752,17 @@ class MainWindow(QMainWindow):
         self.chat_view.insertHtml("".join(lines))
         self.chat_view.moveCursor(QTextCursor.MoveOperation.End)
 
+    def _current_session_has_user_messages(self) -> bool:
+        if self.current_index < 0:
+            return False
+        sess = self.sessions[self.current_index]
+        return any(m["role"] == "user" for m in sess.messages)
+
     def new_chat(self):
+        if self.current_index >= 0 and not self._current_session_has_user_messages():
+            QMessageBox.information(self, "New chat", "Use the current chat first (send at least one message) before creating another.")
+            return
+
         title = f"Chat {len(self.sessions) + 1}"
         system_prompt = (
             "You are a helpful assistant. Provide high-quality answers. Be clear, detailed, and concise. "
@@ -702,26 +790,29 @@ class MainWindow(QMainWindow):
             who = "You" if m["role"] == "user" else "Assistant"
             self.append_message(who, m["content"])
 
-    def open_settings(self):
-        dlg = SettingsDialog(self, self.settings)
+    def open_app_settings(self):
+        dlg = AppSettingsDialog(self, self.settings)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             if dlg.apply():
                 self.engine.unload()
-                cache = WebCache(db_path=os.path.join(os.path.expanduser("~"), ".koila", "webcache.sqlite")) if self.settings.browse_cache_enabled else None
-                self.browser = Browser(
-                    timeout_sec=self.settings.browse_timeout_sec,
-                    max_chars_per_source=self.settings.browse_max_chars_per_source,
-                    min_text_len=self.settings.browse_min_text_len,
-                    cache=cache
-                )
-                self.chk_browse.setChecked(self.settings.browse_enabled_default)
+                self.refresh_model_list()
                 self.set_busy(False, "Settings saved.")
             else:
                 self.set_busy(False, "Settings not applied.")
 
+    def open_browsing_settings(self):
+        dlg = BrowsingSettingsDialog(self, self.settings)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            if dlg.apply():
+                self._rebuild_browser()
+                self.chk_browse.setChecked(self.settings.browse_enabled_default)
+                self.set_busy(False, "Browsing settings saved.")
+            else:
+                self.set_busy(False, "Browsing settings not applied.")
+
     def warm_load_model(self):
         if not self.settings.model_path:
-            QMessageBox.information(self, "Model required", "Set a GGUF model in App → Settings first.")
+            QMessageBox.information(self, "Model required", "Select a GGUF model from the dropdown first.")
             return
         try:
             self.set_busy(True, "Loading model…")
@@ -744,6 +835,19 @@ class MainWindow(QMainWindow):
             sess.title = (first[:28] + "…") if len(first) > 28 else first
             self.session_list.item(self.current_index).setText(sess.title)
 
+    def _filtered_history_for_browsing(self, base: List[Message]) -> List[Message]:
+        out: List[Message] = []
+        for m in base:
+            if m["role"] != "assistant":
+                out.append(m)
+                continue
+            c = (m.get("content") or "").lower()
+            if ("real-time" in c or "real time" in c or "can't browse" in c or "cannot browse" in c
+                    or "no internet access" in c or "don't have access to the internet" in c):
+                continue
+            out.append(m)
+        return out
+
     def on_send(self):
         if self.current_index < 0:
             return
@@ -752,8 +856,8 @@ class MainWindow(QMainWindow):
         if not user_text:
             return
 
-        if not self.settings.model_path:
-            QMessageBox.information(self, "Model required", "Set a GGUF model in App → Settings first.")
+        if not self.settings.model_path or not os.path.isfile(self.settings.model_path):
+            QMessageBox.information(self, "Model required", "Select a valid GGUF model from the dropdown first.")
             return
 
         sess = self.sessions[self.current_index]
@@ -767,6 +871,8 @@ class MainWindow(QMainWindow):
         browse_this = self.chk_browse.isChecked()
         if browse_this:
             base = [m for m in sess.messages if not (m["role"] == "user" and m["content"] == user_text)]
+            base = self._filtered_history_for_browsing(base)
+
             self.worker_browse = BrowseAndStreamWorker(self.engine, base, user_text, self.settings, self.browser)
             self.worker_browse.status.connect(lambda s: self.set_busy(True, s))
             self.worker_browse.chunk.connect(self.append_stream_chunk)
