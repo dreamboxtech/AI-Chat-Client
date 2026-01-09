@@ -1,7 +1,6 @@
 import os
 import sys
 import time
-import json
 import re
 import sqlite3
 import urllib.parse
@@ -10,12 +9,12 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional, Iterable, Tuple
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QTextCursor
+from PyQt6.QtGui import QTextCursor, QKeyEvent
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLineEdit, QLabel, QListWidget, QTextEdit,
-    QMessageBox, QFileDialog, QDialog, QFormLayout,
-    QSpinBox, QDoubleSpinBox, QDialogButtonBox, QCheckBox
+    QPushButton, QLabel, QListWidget, QMessageBox, QFileDialog,
+    QDialog, QFormLayout, QSpinBox, QDoubleSpinBox, QDialogButtonBox,
+    QCheckBox, QPlainTextEdit, QLineEdit, QTextBrowser
 )
 
 from llama_cpp import Llama
@@ -23,20 +22,13 @@ from llama_cpp import Llama
 Message = Dict[str, str]  # {"role": "system"|"user"|"assistant", "content": "..."}
 
 
-# -----------------------------
-# Settings / Session Models
-# -----------------------------
-
 @dataclass
 class AppSettings:
     model_path: str = ""
-
-    # Generation
     temperature: float = 0.7
     max_tokens: int = 256
     stream: bool = True
 
-    # Runtime speed knobs (model-agnostic)
     n_ctx: int = 2048
     n_threads: int = max(1, (os.cpu_count() or 8) - 1)
     n_batch: int = 256
@@ -45,15 +37,14 @@ class AppSettings:
     use_mlock: bool = False
     flash_attn: bool = False
 
-    # Keep UI fast over time
     keep_last_messages: int = 16
 
-    # Browsing (model-agnostic hallucination reducer)
     browse_enabled_default: bool = False
     browse_num_sources: int = 3
     browse_timeout_sec: int = 12
-    browse_max_chars_per_source: int = 1600  # keep evidence small for speed
+    browse_max_chars_per_source: int = 1600
     browse_cache_enabled: bool = True
+    browse_min_text_len: int = 500
 
 
 @dataclass
@@ -62,12 +53,28 @@ class ChatSession:
     messages: List[Message]
 
 
-# -----------------------------
-# Simple web search + fetch (DuckDuckGo Lite/HTML)
-# -----------------------------
+def _escape_html(s: str) -> str:
+    return (s.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&#39;"))
+
+
+def render_text_as_html(text: str) -> str:
+    t = _escape_html(text)
+    t = re.sub(r"`([^`]+)`", r"<code>\1</code>", t)
+    t = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", t)
+    t = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", t)
+    return t.replace("\n", "<br>")
+
+
+def linkify_url(url: str) -> str:
+    u = _escape_html(url)
+    return f'<a href="{u}">{u}</a>'
+
 
 class WebCache:
-    """Tiny SQLite cache for fetched pages."""
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._init()
@@ -93,58 +100,54 @@ class WebCache:
 
 
 class Browser:
-    """
-    Best-effort, no-API-key browsing:
-    - search with DuckDuckGo Lite (fast HTML)
-    - fallback to DDG HTML
-    - fetch pages and extract rough text
-    """
-    def __init__(self, timeout_sec: int = 12, cache: Optional[WebCache] = None):
+    def __init__(self, timeout_sec: int, max_chars_per_source: int, min_text_len: int, cache: Optional[WebCache]):
         self.timeout_sec = timeout_sec
+        self.max_chars_per_source = max_chars_per_source
+        self.min_text_len = min_text_len
         self.cache = cache
-        self.ua = "Mozilla/5.0 (KoilaLocalChat/1.0; +https://example.local)"
+        self.ua = "Mozilla/5.0 (KoilaLocalChat/1.0)"
+        self.deny_substrings = [
+            "grammar", "spell", "checker", "editor",
+            "translate", "converter", "calculator",
+        ]
 
     def _http_get(self, url: str) -> str:
         req = urllib.request.Request(url, headers={"User-Agent": self.ua})
         with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
             data = resp.read()
-        # best-effort decode
         return data.decode("utf-8", errors="ignore")
 
     def search(self, query: str, k: int) -> List[str]:
         q = urllib.parse.quote_plus(query)
 
-        # Try Lite first (simpler/faster)
         lite_url = f"https://lite.duckduckgo.com/lite/?q={q}"
         try:
             html = self._http_get(lite_url)
             urls = self._parse_ddg_lite_results(html, k)
+            urls = self._filter_urls(urls)
             if urls:
                 return urls
         except Exception:
             pass
 
-        # Fallback to HTML endpoint
         html_url = f"https://html.duckduckgo.com/html/?q={q}"
         html = self._http_get(html_url)
         urls = self._parse_ddg_html_results(html, k)
+        urls = self._filter_urls(urls)
         return urls
 
     def _parse_ddg_lite_results(self, html: str, k: int) -> List[str]:
-        # Lite uses simple <a rel="nofollow" class="result-link" href="...">
         urls: List[str] = []
         for m in re.finditer(r'href="(https?://[^"]+)"', html):
             u = m.group(1)
-            # skip ddg internal/nav
             if "duckduckgo.com" in urllib.parse.urlparse(u).netloc:
                 continue
             urls.append(u)
-            if len(urls) >= k:
+            if len(urls) >= k * 3:
                 break
-        return self._dedupe(urls)
+        return self._dedupe(urls)[:k]
 
     def _parse_ddg_html_results(self, html: str, k: int) -> List[str]:
-        # HTML endpoint often uses redirect links with "uddg=" param
         urls: List[str] = []
         for m in re.finditer(r'href="([^"]+)"', html):
             href = m.group(1)
@@ -162,10 +165,9 @@ class Browser:
                 if "duckduckgo.com" in urllib.parse.urlparse(href).netloc:
                     continue
                 urls.append(href)
-
-            if len(urls) >= k:
+            if len(urls) >= k * 3:
                 break
-        return self._dedupe(urls)
+        return self._dedupe(urls)[:k]
 
     def _dedupe(self, urls: List[str]) -> List[str]:
         out, seen = [], set()
@@ -176,34 +178,42 @@ class Browser:
             out.append(u)
         return out
 
-    def fetch_text(self, url: str, max_chars: int) -> str:
+    def _filter_urls(self, urls: List[str]) -> List[str]:
+        good: List[str] = []
+        for u in urls:
+            host = urllib.parse.urlparse(u).netloc.lower()
+            if any(bad in host for bad in self.deny_substrings):
+                continue
+            good.append(u)
+        return good
+
+    def fetch_text(self, url: str) -> str:
         if self.cache:
             cached = self.cache.get(url)
             if cached is not None:
-                return cached[:max_chars]
+                return cached[: self.max_chars_per_source]
 
         html = self._http_get(url)
         text = self._html_to_text(html)
         text = re.sub(r"\s+", " ", text).strip()
 
+        host = urllib.parse.urlparse(url).netloc.lower()
+        if any(bad in host for bad in self.deny_substrings):
+            return ""
+        if len(text) < self.min_text_len:
+            return ""
+
         if self.cache:
             self.cache.put(url, text)
-        return text[:max_chars]
+        return text[: self.max_chars_per_source]
 
     def _html_to_text(self, html: str) -> str:
-        # remove scripts/styles
         html = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
         html = re.sub(r"(?is)<style.*?>.*?</style>", " ", html)
-        # remove tags
         html = re.sub(r"(?s)<.*?>", " ", html)
-        # decode some entities
         html = html.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
         return html
 
-
-# -----------------------------
-# Engine (loads once, reused)
-# -----------------------------
 
 class LlamaCppEngine:
     def __init__(self):
@@ -240,11 +250,11 @@ class LlamaCppEngine:
         self._signature = sig
 
     def _trim_history(self, messages: List[Message], keep_last: int) -> List[Message]:
-        if keep_last <= 0:
-            return messages
         system = [m for m in messages if m["role"] == "system"]
         rest = [m for m in messages if m["role"] != "system"]
-        return system + rest[-keep_last:]
+        if keep_last > 0:
+            rest = rest[-keep_last:]
+        return system + rest
 
     def chat_stream(self, messages: List[Message], s: AppSettings) -> Iterable[str]:
         self.load_if_needed(s)
@@ -266,13 +276,9 @@ class LlamaCppEngine:
                 continue
 
 
-# -----------------------------
-# Workers
-# -----------------------------
-
 class StreamWorker(QThread):
     chunk = pyqtSignal(str)
-    finished_full = pyqtSignal(str)
+    finished_full = pyqtSignal(str)  # assistant_text
     failed = pyqtSignal(str)
 
     def __init__(self, engine: LlamaCppEngine, messages: List[Message], settings: AppSettings):
@@ -295,7 +301,7 @@ class StreamWorker(QThread):
 class BrowseAndStreamWorker(QThread):
     status = pyqtSignal(str)
     chunk = pyqtSignal(str)
-    finished_full = pyqtSignal(str, str)  # (assistant_text, sources_text)
+    finished_full = pyqtSignal(str, list)  # assistant_text, urls_used
     failed = pyqtSignal(str)
 
     def __init__(self, engine: LlamaCppEngine, base_messages: List[Message], user_query: str, settings: AppSettings, browser: Browser):
@@ -313,33 +319,34 @@ class BrowseAndStreamWorker(QThread):
             urls = self.browser.search(self.user_query, self.settings.browse_num_sources)
 
             snippets: List[Tuple[str, str]] = []
-            for i, url in enumerate(urls, start=1):
+            for url in urls:
                 try:
-                    txt = self.browser.fetch_text(url, self.settings.browse_max_chars_per_source)
+                    txt = self.browser.fetch_text(url)
                     if txt:
                         snippets.append((url, txt))
                 except Exception:
                     continue
 
             if not snippets:
-                # fallback: still answer, but tell model no sources found
-                evidence = "No web sources could be fetched."
-                sources_text = ""
-            else:
-                evidence_lines = ["Web evidence (use for answering; cite as [1], [2], ...):"]
-                sources_lines = []
-                for idx, (url, txt) in enumerate(snippets, start=1):
-                    evidence_lines.append(f"[{idx}] {url}\n{txt}\n")
-                    sources_lines.append(f"[{idx}] {url}")
-                evidence = "\n".join(evidence_lines).strip()
-                sources_text = "\n".join(sources_lines).strip()
+                self.finished_full.emit(
+                    "I couldn’t verify this from web sources (no usable sources were fetched). Please try again or refine the query.",
+                    []
+                )
+                return
+
+            evidence_lines = ["Web evidence (use for answering; cite as [1], [2], ...):"]
+            urls_used: List[str] = []
+            for idx, (url, txt) in enumerate(snippets, start=1):
+                evidence_lines.append(f"[{idx}] {url}\n{txt}\n")
+                urls_used.append(url)
+            evidence = "\n".join(evidence_lines).strip()
 
             browse_rules = (
                 "BROWSING RULES:\n"
                 "- Use the provided web evidence when answering.\n"
                 "- If the evidence does not contain the answer, say you couldn't confirm from sources.\n"
                 "- Do not invent facts.\n"
-                "- Add citations like [1] [2] next to the relevant sentences.\n"
+                "- Add citations like [1] [2] next to relevant sentences.\n"
             )
 
             augmented = list(self.base_messages)
@@ -347,19 +354,15 @@ class BrowseAndStreamWorker(QThread):
             augmented.append({"role": "system", "content": evidence})
             augmented.append({"role": "user", "content": self.user_query})
 
-            self.status.emit("Answering…")
+            self.status.emit(f"Answering… (sources: {len(urls_used)})")
             for t in self.engine.chat_stream(augmented, self.settings):
                 self._accum.append(t)
                 self.chunk.emit(t)
 
-            self.finished_full.emit("".join(self._accum), sources_text)
+            self.finished_full.emit("".join(self._accum), urls_used)
         except Exception as e:
             self.failed.emit(str(e))
 
-
-# -----------------------------
-# Settings UI
-# -----------------------------
 
 class SettingsDialog(QDialog):
     def __init__(self, parent, settings: AppSettings):
@@ -370,7 +373,6 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         form = QFormLayout()
 
-        # Model
         self.model_path = QLineEdit(self.settings.model_path)
         self.btn_browse = QPushButton("Browse…")
         row = QHBoxLayout()
@@ -379,7 +381,6 @@ class SettingsDialog(QDialog):
         row_wrap = QWidget()
         row_wrap.setLayout(row)
 
-        # Generation
         self.temperature = QDoubleSpinBox()
         self.temperature.setRange(0.0, 2.0)
         self.temperature.setSingleStep(0.05)
@@ -392,7 +393,6 @@ class SettingsDialog(QDialog):
         self.stream = QCheckBox("Stream responses")
         self.stream.setChecked(self.settings.stream)
 
-        # Runtime knobs
         self.n_ctx = QSpinBox()
         self.n_ctx.setRange(512, 32768)
         self.n_ctx.setValue(self.settings.n_ctx)
@@ -422,7 +422,6 @@ class SettingsDialog(QDialog):
         self.keep_last.setRange(4, 200)
         self.keep_last.setValue(self.settings.keep_last_messages)
 
-        # Browsing
         self.browse_default = QCheckBox("Enable browsing by default")
         self.browse_default.setChecked(self.settings.browse_enabled_default)
 
@@ -437,6 +436,10 @@ class SettingsDialog(QDialog):
         self.browse_max_chars = QSpinBox()
         self.browse_max_chars.setRange(200, 6000)
         self.browse_max_chars.setValue(self.settings.browse_max_chars_per_source)
+
+        self.browse_min_len = QSpinBox()
+        self.browse_min_len.setRange(100, 5000)
+        self.browse_min_len.setValue(self.settings.browse_min_text_len)
 
         self.browse_cache = QCheckBox("Cache fetched pages (recommended)")
         self.browse_cache.setChecked(self.settings.browse_cache_enabled)
@@ -459,6 +462,7 @@ class SettingsDialog(QDialog):
         form.addRow("Sources:", self.browse_sources)
         form.addRow("Timeout (sec):", self.browse_timeout)
         form.addRow("Max chars/source:", self.browse_max_chars)
+        form.addRow("Min text length:", self.browse_min_len)
         form.addRow("", self.browse_cache)
 
         layout.addLayout(form)
@@ -501,13 +505,23 @@ class SettingsDialog(QDialog):
         self.settings.browse_num_sources = int(self.browse_sources.value())
         self.settings.browse_timeout_sec = int(self.browse_timeout.value())
         self.settings.browse_max_chars_per_source = int(self.browse_max_chars.value())
+        self.settings.browse_min_text_len = int(self.browse_min_len.value())
         self.settings.browse_cache_enabled = bool(self.browse_cache.isChecked())
         return True
 
 
-# -----------------------------
-# Main UI
-# -----------------------------
+class ChatInput(QPlainTextEdit):
+    sendRequested = pyqtSignal()
+
+    def keyPressEvent(self, e: QKeyEvent):
+        if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                super().keyPressEvent(e)
+            else:
+                self.sendRequested.emit()
+        else:
+            super().keyPressEvent(e)
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -518,13 +532,20 @@ class MainWindow(QMainWindow):
         self.engine = LlamaCppEngine()
 
         cache = WebCache(db_path=os.path.join(os.path.expanduser("~"), ".koila", "webcache.sqlite"))
-        self.browser = Browser(timeout_sec=self.settings.browse_timeout_sec, cache=cache)
+        self.browser = Browser(
+            timeout_sec=self.settings.browse_timeout_sec,
+            max_chars_per_source=self.settings.browse_max_chars_per_source,
+            min_text_len=self.settings.browse_min_text_len,
+            cache=cache if self.settings.browse_cache_enabled else None
+        )
 
         self.sessions: List[ChatSession] = []
         self.current_index: int = -1
 
         self.worker_stream: Optional[StreamWorker] = None
         self.worker_browse: Optional[BrowseAndStreamWorker] = None
+
+        self._stream_start_pos: Optional[int] = None
 
         self._build_ui()
         self._build_menu()
@@ -533,7 +554,6 @@ class MainWindow(QMainWindow):
     def _build_menu(self):
         menubar = self.menuBar()
         app_menu = menubar.addMenu("App")
-
         act_settings = app_menu.addAction("Settings…")
         act_warm = app_menu.addAction("Warm-load model")
         act_unload = app_menu.addAction("Unload model")
@@ -550,7 +570,6 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         layout = QHBoxLayout(root)
 
-        # left: sessions
         left = QVBoxLayout()
         self.btn_new_chat = QPushButton("New chat")
         self.session_list = QListWidget()
@@ -561,14 +580,19 @@ class MainWindow(QMainWindow):
         left_wrap.setLayout(left)
         left_wrap.setFixedWidth(260)
 
-        # right: chat
         right = QVBoxLayout()
-        self.chat_view = QTextEdit()
-        self.chat_view.setReadOnly(True)
+
+        self.chat_view = QTextBrowser()
+        self.chat_view.setOpenExternalLinks(True)
+        self.chat_view.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse |
+            Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
 
         input_row = QHBoxLayout()
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("Type a message…")
+        self.input = ChatInput()
+        self.input.setPlaceholderText("Type a message… (Enter to send, Shift+Enter for new line)")
+        self.input.setFixedHeight(90)
 
         self.chk_browse = QCheckBox("Browse")
         self.chk_browse.setChecked(self.settings.browse_enabled_default)
@@ -592,40 +616,63 @@ class MainWindow(QMainWindow):
         layout.addWidget(left_wrap)
         layout.addWidget(right_wrap)
 
-        # signals
         self.btn_new_chat.clicked.connect(self.new_chat)
         self.session_list.currentRowChanged.connect(self.switch_chat)
         self.btn_send.clicked.connect(self.on_send)
-        self.input.returnPressed.connect(self.on_send)
+        self.input.sendRequested.connect(self.on_send)
 
-    def set_busy(self, busy: bool):
+    def set_busy(self, busy: bool, status: str = ""):
         self.btn_send.setEnabled(not busy)
         self.input.setEnabled(not busy)
         self.btn_new_chat.setEnabled(not busy)
         self.session_list.setEnabled(not busy)
         self.chk_browse.setEnabled(not busy)
-        if not busy:
+        if status:
+            self.status.setText(status)
+        elif not busy:
             self.status.setText("Ready.")
 
-    def append_block(self, who: str, text: str):
-        self.chat_view.append(f"<b>{who}:</b>")
-        self.chat_view.append(text.replace("\n", "<br>"))
-        self.chat_view.append("")
+    def append_message(self, who: str, content: str):
+        html = f"<b>{_escape_html(who)}:</b><br>{render_text_as_html(content)}<br><br>"
+        self.chat_view.moveCursor(QTextCursor.MoveOperation.End)
+        self.chat_view.insertHtml(html)
+        self.chat_view.moveCursor(QTextCursor.MoveOperation.End)
 
     def begin_stream_assistant(self):
-        self.chat_view.append("<b>Assistant: </b>")
-        self._stream_cursor = self.chat_view.textCursor()
-        self._stream_cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.chat_view.setTextCursor(self._stream_cursor)
+        self.chat_view.moveCursor(QTextCursor.MoveOperation.End)
+        self.chat_view.insertHtml("<b>Assistant:</b><br>")
+        self.chat_view.moveCursor(QTextCursor.MoveOperation.End)
+        self._stream_start_pos = self.chat_view.textCursor().position()
 
     def append_stream_chunk(self, chunk: str):
         self.chat_view.moveCursor(QTextCursor.MoveOperation.End)
         self.chat_view.insertPlainText(chunk)
         self.chat_view.moveCursor(QTextCursor.MoveOperation.End)
 
-    def end_stream_assistant(self):
-        self.chat_view.append("")
-        self.chat_view.append("")
+    def end_stream_assistant(self, full_text: Optional[str] = None):
+        if full_text is not None and self._stream_start_pos is not None:
+            cur = self.chat_view.textCursor()
+            cur.setPosition(self._stream_start_pos)
+            cur.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+            cur.removeSelectedText()
+            cur.insertHtml(render_text_as_html(full_text))
+            self.chat_view.setTextCursor(cur)
+            self.chat_view.moveCursor(QTextCursor.MoveOperation.End)
+
+        self.chat_view.insertHtml("<br><br>")
+        self.chat_view.moveCursor(QTextCursor.MoveOperation.End)
+        self._stream_start_pos = None
+
+    def append_sources(self, urls: List[str]):
+        if not urls:
+            return
+        lines = ["<b>Sources:</b><br>"]
+        for i, u in enumerate(urls, start=1):
+            lines.append(f"[{i}] {linkify_url(u)}<br>")
+        lines.append("<br>")
+        self.chat_view.moveCursor(QTextCursor.MoveOperation.End)
+        self.chat_view.insertHtml("".join(lines))
+        self.chat_view.moveCursor(QTextCursor.MoveOperation.End)
 
     def new_chat(self):
         title = f"Chat {len(self.sessions) + 1}"
@@ -653,37 +700,43 @@ class MainWindow(QMainWindow):
             if m["role"] == "system":
                 continue
             who = "You" if m["role"] == "user" else "Assistant"
-            self.append_block(who, m["content"])
+            self.append_message(who, m["content"])
 
     def open_settings(self):
         dlg = SettingsDialog(self, self.settings)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             if dlg.apply():
                 self.engine.unload()
-                # update browser timeout/cache preference
                 cache = WebCache(db_path=os.path.join(os.path.expanduser("~"), ".koila", "webcache.sqlite")) if self.settings.browse_cache_enabled else None
-                self.browser = Browser(timeout_sec=self.settings.browse_timeout_sec, cache=cache)
+                self.browser = Browser(
+                    timeout_sec=self.settings.browse_timeout_sec,
+                    max_chars_per_source=self.settings.browse_max_chars_per_source,
+                    min_text_len=self.settings.browse_min_text_len,
+                    cache=cache
+                )
                 self.chk_browse.setChecked(self.settings.browse_enabled_default)
-                self.status.setText("Settings saved.")
+                self.set_busy(False, "Settings saved.")
             else:
-                self.status.setText("Settings not applied.")
+                self.set_busy(False, "Settings not applied.")
 
     def warm_load_model(self):
         if not self.settings.model_path:
             QMessageBox.information(self, "Model required", "Set a GGUF model in App → Settings first.")
             return
         try:
+            self.set_busy(True, "Loading model…")
             t0 = time.time()
             self.engine.load_if_needed(self.settings)
             dt = time.time() - t0
-            self.status.setText(f"Model loaded in {dt:.1f}s")
+            self.set_busy(False, f"Model loaded in {dt:.1f}s")
         except Exception as e:
             self.engine.unload()
+            self.set_busy(False)
             QMessageBox.critical(self, "Load failed", str(e))
 
     def unload_model(self):
         self.engine.unload()
-        self.status.setText("Model unloaded.")
+        self.set_busy(False, "Model unloaded.")
 
     def _autotitle_if_first_user(self, sess: ChatSession):
         if len([m for m in sess.messages if m["role"] == "user"]) == 1:
@@ -695,7 +748,7 @@ class MainWindow(QMainWindow):
         if self.current_index < 0:
             return
 
-        user_text = self.input.text().strip()
+        user_text = self.input.toPlainText().strip()
         if not user_text:
             return
 
@@ -705,53 +758,56 @@ class MainWindow(QMainWindow):
 
         sess = self.sessions[self.current_index]
         sess.messages.append({"role": "user", "content": user_text})
-        self.input.clear()
-        self.append_block("You", user_text)
+        self.input.setPlainText("")
+        self.append_message("You", user_text)
 
-        self.set_busy(True)
+        self.set_busy(True, "Answering…")
         self.begin_stream_assistant()
 
         browse_this = self.chk_browse.isChecked()
         if browse_this:
-            self.status.setText("Browsing…")
-            # base messages exclude the just-added user turn (we add it after evidence)
             base = [m for m in sess.messages if not (m["role"] == "user" and m["content"] == user_text)]
             self.worker_browse = BrowseAndStreamWorker(self.engine, base, user_text, self.settings, self.browser)
-            self.worker_browse.status.connect(self.status.setText)
+            self.worker_browse.status.connect(lambda s: self.set_busy(True, s))
             self.worker_browse.chunk.connect(self.append_stream_chunk)
             self.worker_browse.finished_full.connect(self.on_browse_done)
             self.worker_browse.failed.connect(self.on_failed)
             self.worker_browse.start()
         else:
-            self.status.setText("Answering…")
             self.worker_stream = StreamWorker(self.engine, list(sess.messages), self.settings)
             self.worker_stream.chunk.connect(self.append_stream_chunk)
             self.worker_stream.finished_full.connect(self.on_stream_done)
             self.worker_stream.failed.connect(self.on_failed)
             self.worker_stream.start()
 
-    def on_browse_done(self, full_text: str, sources_text: str):
-        self.end_stream_assistant()
+    def on_browse_done(self, full_text: str, urls_used: List[str]):
+        self.end_stream_assistant(full_text)
+
         sess = self.sessions[self.current_index]
         sess.messages.append({"role": "assistant", "content": full_text})
-        if sources_text:
-            self.append_block("Sources", sources_text)
         self._autotitle_if_first_user(sess)
+
+        if urls_used:
+            self.append_sources(urls_used)
+
         self.set_busy(False)
         self.worker_browse = None
 
     def on_stream_done(self, full_text: str):
-        self.end_stream_assistant()
+        self.end_stream_assistant(full_text)
+
         sess = self.sessions[self.current_index]
         sess.messages.append({"role": "assistant", "content": full_text})
         self._autotitle_if_first_user(sess)
+
         self.set_busy(False)
         self.worker_stream = None
 
     def on_failed(self, err: str):
         self.engine.unload()
-        QMessageBox.critical(self, "Generation failed", err)
+        self.end_stream_assistant("")
         self.set_busy(False)
+        QMessageBox.critical(self, "Generation failed", err)
         self.worker_stream = None
         self.worker_browse = None
 
